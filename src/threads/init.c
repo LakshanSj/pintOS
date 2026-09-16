@@ -70,6 +70,56 @@ static void locate_block_devices (void);
 static void locate_block_device (enum block_type, const char *name);
 #endif
 
+void run_interactive_shell(void) {
+    char buffer[128];
+    int pos = 0;
+    
+    printf("CS2042> ");
+    
+    while (1) {
+        pos = 0;
+        memset(buffer, 0, sizeof(buffer));
+
+        while (1) {
+            uint8_t c = input_getc();
+            if (c == '\r' || c == '\n') {
+                printf("\n");
+                break;
+            } else if (c == '\b') {
+                if (pos > 0) {
+                    pos--;
+                    printf("\b \b");
+                }
+            } else {
+                buffer[pos++] = c;
+                printf("%c", c);
+            }
+        }
+
+        buffer[pos] = '\0';
+
+        if (strcmp(buffer, "whoami") == 0) {
+            printf("Lakshan - 240294R\n"); 
+        } else if (strcmp(buffer, "shutdown") == 0) {
+            shutdown_power_off();
+        } else if (strcmp(buffer, "time") == 0) {
+            printf("%llu seconds since Unix epoch\n", rtc_get_time()); 
+        } else if (strcmp(buffer, "ram") == 0) {
+            printf("Available RAM: %d KB\n", init_ram_pages * 4); 
+        } else if (strcmp(buffer, "thread") == 0) {
+            thread_print_stats();
+        } else if (strcmp(buffer, "priority") == 0) {
+            printf("Current thread priority: %d\n", thread_get_priority());
+        } else if (strcmp(buffer, "exit") == 0) {
+            printf("Exiting interactive shell... Bye!\n");
+            break; 
+        } else if (pos > 0) {
+            printf("Unknown command: '%s'\n", buffer);
+        }
+        
+        printf("CS2042> ");
+    }
+}
 int pintos_init (void) NO_RETURN;
 
 /* Pintos main entry point. */
@@ -134,6 +184,7 @@ pintos_init (void)
     run_actions (argv);
   } else {
     // TODO: no command line passed to kernel. Run interactively 
+    run_interactive_shell();
   }
 
   /* Finish up. */

@@ -577,6 +577,7 @@ init_thread (struct thread *t, const char *name, int priority)
     }
   t->wait_on_lock = NULL;
   t->magic = THREAD_MAGIC;
+  list_init (&t->children);
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

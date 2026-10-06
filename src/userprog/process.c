@@ -17,6 +17,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -28,34 +29,55 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
-  char *fn_copy_2;
-  char *save_ptr;
-  char *prog_name;
-  tid_t tid;
-
-  /* Make a copy of FILE_NAME for start_process. */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  char *fn_copy = palloc_get_page (0);
+  char *fn_copy_2 = palloc_get_page (0);
+  if (fn_copy == NULL || fn_copy_2 == NULL) 
     return TID_ERROR;
+  
   strlcpy (fn_copy, file_name, PGSIZE);
-
-  /* Make a second temporary copy to extract the program name */
-  fn_copy_2 = palloc_get_page (0);
-  if (fn_copy_2 == NULL) 
-    {
-      palloc_free_page (fn_copy);
-      return TID_ERROR;
-    }
   strlcpy (fn_copy_2, file_name, PGSIZE);
-  prog_name = strtok_r (fn_copy_2, " ", &save_ptr);
 
-  /* Create a new thread to execute PROG_NAME. */
-  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  char *save_ptr;
+  char *prog_name = strtok_r (fn_copy_2, " ", &save_ptr);
+
+  /* Allocate and initialize shared child state */
+  struct child_entry *ce = malloc (sizeof (struct child_entry));
+  if (ce == NULL)
+    return TID_ERROR;
+  
+  sema_init (&ce->sema_load, 0);
+  sema_init (&ce->sema_exit, 0);
+  ce->is_loaded = false;
+  ce->has_exited = false;
+  ce->has_been_waited = false;
+  ce->exit_status = -1;
+
+  /* Add to parent's children list */
+  list_push_back (&thread_current ()->children, &ce->elem);
+
+  /* Package arguments for the new thread */
+  void **args = malloc (2 * sizeof (void *));
+  args[0] = fn_copy;
+  args[1] = ce;
+
+  tid_t tid = thread_create (prog_name, PRI_DEFAULT, start_process, args);
   palloc_free_page (fn_copy_2);
 
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  if (tid == TID_ERROR) 
+    {
+      palloc_free_page (fn_copy);
+      free (args);
+      free (ce);
+      return TID_ERROR;
+    }
+
+  ce->tid = tid;
+  
+  /* Wait for the child to finish load() */
+  sema_down (&ce->sema_load); 
+
+  if (!ce->is_loaded) 
+    return TID_ERROR; // Return -1 if the executable failed to load
 
   return tid;
 }
@@ -103,48 +125,49 @@ static void push_arguments_to_stack (char **arguments, int arg_count, void **esp
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *args_)
 {
-  char *file_name = file_name_;
+  /* Unpack arguments */
+  void **args = (void **) args_;
+  char *file_name = args[0];
+  struct child_entry *ce = args[1];
+  free (args);
+
+  /* Link current thread to the parent's shared state */
+  thread_current ()->shared_entry = ce;
+
   struct intr_frame if_;
   bool success;
 
-  char *arguments[64]; // Array to hold up to 64 arguments
+  char *arguments[64];
   int arg_count = 0;
   char *token, *save_ptr;
 
   for (token = strtok_r (file_name, " ", &save_ptr); token != NULL; token = strtok_r (NULL, " ", &save_ptr))
     {
       arguments[arg_count++] = token;
-      if (arg_count >= 64)
-        break; // Prevent overflow if there are more than 64 arguments
+      if (arg_count >= 64) break;
     }
 
-  /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  
+  success = load (arguments[0], &if_.eip, &if_.esp);
 
   if (success) 
-    {
-      push_arguments_to_stack(arguments, arg_count, &if_.esp); 
-      hex_dump ((uintptr_t) if_.esp, if_.esp, (uintptr_t) PHYS_BASE - (uintptr_t) if_.esp, true);
-    }
+    push_arguments_to_stack(arguments, arg_count, &if_.esp); 
 
-  /* If load failed, quit. */
+  /* Update status and wake up the parent waiting in process_execute */
+  ce->is_loaded = success;
+  sema_up (&ce->sema_load);
+
   palloc_free_page (file_name);
+  
   if (!success) 
     thread_exit ();
 
-  /* Start the user process by simulating a return from an
-     interrupt, implemented by intr_exit (in
-     threads/intr-stubs.S).  Because intr_exit takes all of its
-     arguments on the stack in the form of a `struct intr_frame',
-     we just point the stack pointer (%esp) to our stack frame
-     and jump to it. */
-  hex_dump ((uintptr_t) if_.esp, if_.esp, (uintptr_t) PHYS_BASE - (uintptr_t) if_.esp, true);
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -159,10 +182,39 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  for(;;);
-  return -1;
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  struct child_entry *child = NULL;
+
+  /* Find the child in our list */
+  for (e = list_begin (&cur->children); e != list_end (&cur->children); e = list_next (e))
+    {
+      struct child_entry *ce = list_entry (e, struct child_entry, elem);
+      if (ce->tid == child_tid)
+        {
+          child = ce;
+          break;
+        }
+    }
+
+  /* Reject if invalid TID, not our child, or already waited on */
+  if (child == NULL || child->has_been_waited)
+    return -1;
+
+  child->has_been_waited = true;
+
+  /* Block until the child calls process_exit */
+  sema_down (&child->sema_exit);
+
+  int status = child->exit_status;
+  
+  /* Clean up memory */
+  list_remove (&child->elem);
+  free (child);
+
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -170,20 +222,17 @@ void
 process_exit (void)
 {
   struct thread *cur = thread_current ();
-  uint32_t *pd;
+  
+  /* Wake up parent if it is waiting in process_wait */
+  if (cur->shared_entry != NULL)
+    {
+      cur->shared_entry->has_exited = true;
+      sema_up (&cur->shared_entry->sema_exit);
+    }
 
-  /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
-  pd = cur->pagedir;
+  uint32_t *pd = cur->pagedir;
   if (pd != NULL) 
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);

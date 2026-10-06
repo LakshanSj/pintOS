@@ -5,6 +5,24 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/fixed-point.h"
+#include "threads/synch.h"
+
+/* Thread identifier type.
+   You can redefine this to whatever type you like. */
+typedef int tid_t;
+#define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
+
+/* 1. Define child_entry FIRST (before struct thread) */
+struct child_entry {
+  tid_t tid;
+  int exit_status;
+  bool is_loaded;
+  bool has_exited;
+  bool has_been_waited;
+  struct semaphore sema_load;
+  struct semaphore sema_exit;
+  struct list_elem elem;
+};
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -15,10 +33,7 @@ enum thread_status
     THREAD_DYING        /* About to be destroyed. */
   };
 
-/* Thread identifier type.
-   You can redefine this to whatever type you like. */
-typedef int tid_t;
-#define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
+
 
 /* Thread priorities. */
 #define PRI_MIN 0                       /* Lowest priority. */
@@ -101,11 +116,13 @@ struct thread
     struct lock *wait_on_lock;          /* Lock this thread is currently waiting on. */
     int nice;                           /* Niceness value. */
     int recent_cpu;                     /* Recent CPU usage (fixed-point). */
+    
+    struct list children;               /* List of child_entry structs */
+    struct child_entry *shared_entry;   /* Pointer to self's child_entry */
 
-#ifdef USERPROG
+    /* --- REMOVED #ifdef USERPROG GUARD TO FIX COMPILER ERROR --- */
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
-#endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

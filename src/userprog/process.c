@@ -29,20 +29,75 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
+  char *fn_copy_2;
+  char *save_ptr;
+  char *prog_name;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
+  /* Make a copy of FILE_NAME for start_process. */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  /* Make a second temporary copy to extract the program name */
+  fn_copy_2 = palloc_get_page (0);
+  if (fn_copy_2 == NULL) 
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  strlcpy (fn_copy_2, file_name, PGSIZE);
+  prog_name = strtok_r (fn_copy_2, " ", &save_ptr);
+
+  /* Create a new thread to execute PROG_NAME. */
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
+  palloc_free_page (fn_copy_2);
+
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
+
   return tid;
+}
+
+/* helper function for pushing arguments to the stack */
+static void push_arguments_to_stack (char **arguments, int arg_count, void **esp) 
+{
+  char *arg_addresses[64]; // Array to hold string addresses
+
+  for (int i = arg_count - 1; i >= 0; i--) 
+    {
+      size_t arg_len = strlen(arguments[i]) + 1;
+      *esp -= arg_len;
+      memcpy(*esp, arguments[i], arg_len);
+      arg_addresses[i] = (char *) *esp; 
+    }
+  
+  *esp = (void *) ((uintptr_t) *esp & ~3);
+
+  /* 3. Push null sentinel pointer for argv[arg_count] */
+  *esp -= sizeof (char *);
+  memset (*esp, 0, sizeof (char *));
+
+  /* 4. Push addresses of the string arguments (right to left) */
+  for (int i = arg_count - 1; i >= 0; i--)
+    {
+      *esp -= sizeof (char *);
+      *(char **) *esp = arg_addresses[i];
+    }
+
+  /* 5. Push pointer to argv[0] */
+  char **argv_start = (char **) *esp;
+  *esp -= sizeof (char **);
+  *(char ***) *esp = argv_start;
+
+  /* 6. Push arg_count */
+  *esp -= sizeof (int);
+  *(int *) *esp = arg_count;
+
+  /* 7. Push fake return address (0) */
+  *esp -= sizeof (void *);
+  memset (*esp, 0, sizeof (void *));
 }
 
 /* A thread function that loads a user process and starts it
@@ -54,12 +109,29 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+  char *arguments[64]; // Array to hold up to 64 arguments
+  int arg_count = 0;
+  char *token, *save_ptr;
+
+  for (token = strtok_r (file_name, " ", &save_ptr); token != NULL; token = strtok_r (NULL, " ", &save_ptr))
+    {
+      arguments[arg_count++] = token;
+      if (arg_count >= 64)
+        break; // Prevent overflow if there are more than 64 arguments
+    }
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
+
+  if (success) 
+    {
+      push_arguments_to_stack(arguments, arg_count, &if_.esp); 
+      hex_dump ((uintptr_t) if_.esp, if_.esp, (uintptr_t) PHYS_BASE - (uintptr_t) if_.esp, true);
+    }
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -72,6 +144,7 @@ start_process (void *file_name_)
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
+  hex_dump ((uintptr_t) if_.esp, if_.esp, (uintptr_t) PHYS_BASE - (uintptr_t) if_.esp, true);
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -88,6 +161,7 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
+  for(;;);
   return -1;
 }
 

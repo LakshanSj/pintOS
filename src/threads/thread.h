@@ -126,6 +126,8 @@ struct thread
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+
+    struct file *fd_table[128];
   };
 
 /* If false (default), use round-robin scheduler.

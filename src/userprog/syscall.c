@@ -9,6 +9,7 @@
 #include "filesys/filesys.h"
 #include "filesys/file.h"
 #include "devices/input.h"
+#include <stdint.h>
 
 struct lock filesys_lock;
 
@@ -18,6 +19,7 @@ static void syscall_handler (struct intr_frame *);
 static void check_valid_ptr(const void *vaddr);
 static void check_valid_buffer(const void *buffer, unsigned size);
 static void check_valid_string (const char *str);
+static void check_writable_buffer (void *buffer, unsigned size);
 void sys_exit(int status);
 
 void
@@ -73,6 +75,37 @@ check_valid_string (const char *str)
 }
 
 static void
+check_writable_buffer (void *buffer, unsigned size)
+{
+  if (size == 0)
+    return;
+
+  uintptr_t start = (uintptr_t) buffer;
+  uintptr_t user_top = (uintptr_t) PHYS_BASE;
+
+  /* Reject NULL, kernel addresses, and ranges crossing PHYS_BASE.
+     Subtraction avoids overflow from computing start + size. */
+  if (start == 0 || start >= user_top || size > user_top - start)
+    sys_exit (-1);
+
+  uintptr_t last = start + size - 1;
+  uintptr_t page = (uintptr_t) pg_round_down (buffer);
+
+  /* Check every page touched by the destination buffer. */
+  for (;;)
+    {
+      if (!pagedir_is_writable (thread_current ()->pagedir,
+                                (const void *) page))
+        sys_exit (-1);
+
+      if (last - page < PGSIZE)
+        break;
+
+      page += PGSIZE;
+    }
+}
+
+static void
 syscall_handler (struct intr_frame *f) 
 {
   check_valid_buffer (f->esp, sizeof (int));
@@ -87,11 +120,10 @@ syscall_handler (struct intr_frame *f)
       int status = args[1];
       sys_exit (status);
     }
-  else if (syscall_number == SYS_WRITE) 
+  else if (syscall_number == SYS_WRITE)
     {
-      check_valid_ptr (&args[1]);
-      check_valid_ptr (&args[2]);
-      check_valid_ptr (&args[3]);
+      /* Validate all three complete arguments before reading them. */
+      check_valid_buffer (&args[1], 3 * sizeof (int));
 
       int fd = args[1];
       const void *buffer = (const void *) args[2];
@@ -99,16 +131,27 @@ syscall_handler (struct intr_frame *f)
 
       check_valid_buffer (buffer, size);
 
-      if (fd == 1) 
+      struct thread *cur = thread_current ();
+
+      if (fd == 1)
         {
+          /* Write to the console. */
           putbuf (buffer, size);
           f->eax = size;
-        } 
-      else 
-        {
-          f->eax = -1; 
         }
-    } 
+      else if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+        {
+          /* Write to an opened file. */
+          lock_acquire (&filesys_lock);
+          f->eax = file_write (cur->fd_table[fd], buffer, size);
+          lock_release (&filesys_lock);
+        }
+      else
+        {
+          /* Invalid descriptor, including standard input. */
+          f->eax = -1;
+        }
+    }
   else if (syscall_number == SYS_EXEC) 
     {
       check_valid_ptr (&args[1]);
@@ -140,6 +183,108 @@ syscall_handler (struct intr_frame *f)
     f->eax = filesys_create (file_name, initial_size);
     lock_release (&filesys_lock);
   }
+  else if (syscall_number == SYS_OPEN)
+  {
+    check_valid_buffer (&args[1], sizeof (int));
+
+    const char *file_name = (const char *) args[1];
+    check_valid_string (file_name);
+
+    struct thread *cur = thread_current ();
+    int fd;
+
+    /* Find an available descriptor. */
+    for (fd = 2; fd < 128; fd++)
+      {
+        if (cur->fd_table[fd] == NULL)
+          break;
+      }
+
+    f->eax = -1;
+
+    if (fd < 128)
+      {
+        lock_acquire (&filesys_lock);
+        struct file *opened_file = filesys_open (file_name);
+        lock_release (&filesys_lock);
+
+        if (opened_file != NULL)
+          {
+            cur->fd_table[fd] = opened_file;
+            f->eax = fd;
+          }
+      }
+  }
+  else if (syscall_number == SYS_CLOSE)
+  {
+    check_valid_buffer (&args[1], sizeof (int));
+
+    int fd = args[1];
+    struct thread *cur = thread_current ();
+
+    if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+      {
+        struct file *opened_file = cur->fd_table[fd];
+        cur->fd_table[fd] = NULL;
+
+        lock_acquire (&filesys_lock);
+        file_close (opened_file);
+        lock_release (&filesys_lock);
+      }
+  }
+  else if (syscall_number == SYS_FILESIZE)
+    {
+      check_valid_buffer (&args[1], sizeof (int));
+
+      int fd = args[1];
+      struct thread *cur = thread_current ();
+
+      if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+        {
+          lock_acquire (&filesys_lock);
+          f->eax = file_length (cur->fd_table[fd]);
+          lock_release (&filesys_lock);
+        }
+      else
+        {
+          f->eax = -1;
+        }
+    }
+
+  else if (syscall_number == SYS_READ)
+    {
+      check_valid_buffer (&args[1], 3 * sizeof (int));
+
+      int fd = args[1];
+      void *buffer = (void *) args[2];
+      unsigned size = (unsigned) args[3];
+
+      check_writable_buffer (buffer, size);
+
+      struct thread *cur = thread_current ();
+
+      if (fd == 0)
+        {
+          /* Read from standard input. */
+          unsigned char *bytes = buffer;
+
+          for (unsigned i = 0; i < size; i++)
+            bytes[i] = input_getc ();
+
+          f->eax = size;
+        }
+      else if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+        {
+          lock_acquire (&filesys_lock);
+          f->eax = file_read (cur->fd_table[fd], buffer, size);
+          lock_release (&filesys_lock);
+        }
+      else
+        {
+          /* Invalid descriptor, including standard output. */
+          f->eax = -1;
+        }
+    }
   else 
     {
       sys_exit (-1);

@@ -18,6 +18,7 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "threads/malloc.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -223,6 +224,20 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   
+  /* Close files that this process left open. */
+  lock_acquire (&filesys_lock);
+
+  for (int fd = 2; fd < 128; fd++)
+    {
+      if (cur->fd_table[fd] != NULL)
+        {
+          file_close (cur->fd_table[fd]);
+          cur->fd_table[fd] = NULL;
+        }
+    }
+
+  lock_release (&filesys_lock);
+
   /* Wake up parent if it is waiting in process_wait */
   if (cur->shared_entry != NULL)
     {

@@ -10,16 +10,20 @@
 #include "filesys/file.h"
 #include "devices/input.h"
 
+struct lock filesys_lock;
+
 static void syscall_handler (struct intr_frame *);
 
 /* helper function prototype*/
 static void check_valid_ptr(const void *vaddr);
 static void check_valid_buffer(const void *buffer, unsigned size);
+static void check_valid_string (const char *str);
 void sys_exit(int status);
 
 void
-syscall_init (void) 
+syscall_init (void)
 {
+  lock_init (&filesys_lock);
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
@@ -55,9 +59,23 @@ check_valid_buffer (const void *buffer, unsigned size)
 }
 
 static void
+check_valid_string (const char *str)
+{
+  for (;;)
+    {
+      check_valid_ptr (str);
+
+      if (*str == '\0')
+        return;
+
+      str++;
+    }
+}
+
+static void
 syscall_handler (struct intr_frame *f) 
 {
-  check_valid_ptr (f->esp);
+  check_valid_buffer (f->esp, sizeof (int));
   
   /* Treat the stack pointer as an array of 4-byte integers */
   int *args = f->esp; 
@@ -106,8 +124,25 @@ syscall_handler (struct intr_frame *f)
       
       f->eax = process_wait (pid);
     }
+
+  else if (syscall_number == SYS_CREATE)
+  {
+    /* Validate both complete arguments before reading them. */
+    check_valid_buffer (&args[1], 2 * sizeof (int));
+
+    const char *file_name = (const char *) args[1];
+    unsigned initial_size = (unsigned) args[2];
+
+    /* Validate before acquiring the file system lock. */
+    check_valid_string (file_name);
+
+    lock_acquire (&filesys_lock);
+    f->eax = filesys_create (file_name, initial_size);
+    lock_release (&filesys_lock);
+  }
   else 
     {
       sys_exit (-1);
     }
 }
+

@@ -128,6 +128,7 @@ struct thread
     unsigned magic;                     /* Detects stack overflow. */
 
     struct file *fd_table[128];
+    struct file *executing_file;
   };
 
 /* If false (default), use round-robin scheduler.

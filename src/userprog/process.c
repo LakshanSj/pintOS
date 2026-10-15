@@ -235,6 +235,11 @@ process_exit (void)
           cur->fd_table[fd] = NULL;
         }
     }
+  if (cur->executing_file != NULL)
+  {
+    file_close (cur->executing_file);
+    cur->executing_file = NULL;
+  }
 
   lock_release (&filesys_lock);
 
@@ -352,6 +357,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  lock_acquire (&filesys_lock);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -366,6 +372,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+
+  /* Prevent changes to the executable while it is in use. */
+  file_deny_write (file);
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -448,9 +457,19 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
   success = true;
 
- done:
-  /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  done:
+  if (success)
+    {
+      /* Keep this handle open until the process exits. */
+      t->executing_file = file;
+    }
+  else
+    {
+      /* Closing also releases this handle's write denial. */
+      file_close (file);
+    }
+
+  lock_release (&filesys_lock);
   return success;
 }
 

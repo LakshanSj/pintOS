@@ -10,6 +10,7 @@
 #include "filesys/file.h"
 #include "devices/input.h"
 #include <stdint.h>
+#include "devices/shutdown.h"
 
 struct lock filesys_lock;
 
@@ -152,20 +153,19 @@ syscall_handler (struct intr_frame *f)
           f->eax = -1;
         }
     }
-  else if (syscall_number == SYS_EXEC) 
+  else if (syscall_number == SYS_EXEC)
     {
-      check_valid_ptr (&args[1]);
+      check_valid_buffer (&args[1], sizeof (int));
+
       const char *cmd_line = (const char *) args[1];
-      
-      check_valid_ptr (cmd_line); 
+      check_valid_string (cmd_line);
+
       f->eax = process_execute (cmd_line);
     }
-  else if (syscall_number == SYS_WAIT) 
+  else if (syscall_number == SYS_WAIT)
     {
-      check_valid_ptr (&args[1]);
-      tid_t pid = args[1];
-      
-      f->eax = process_wait (pid);
+      check_valid_buffer (&args[1], sizeof (int));
+      f->eax = process_wait (args[1]);
     }
 
   else if (syscall_number == SYS_CREATE)
@@ -285,6 +285,59 @@ syscall_handler (struct intr_frame *f)
           f->eax = -1;
         }
     }
+  else if (syscall_number == SYS_SEEK)
+    {
+      check_valid_buffer (&args[1], 2 * sizeof (int));
+
+      int fd = args[1];
+      unsigned position = (unsigned) args[2];
+      struct thread *cur = thread_current ();
+
+      if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+        {
+          lock_acquire (&filesys_lock);
+          file_seek (cur->fd_table[fd], position);
+          lock_release (&filesys_lock);
+        }
+    }
+  else if (syscall_number == SYS_TELL)
+    {
+      check_valid_buffer (&args[1], sizeof (int));
+
+      int fd = args[1];
+      struct thread *cur = thread_current ();
+
+      if (fd >= 2 && fd < 128 && cur->fd_table[fd] != NULL)
+        {
+          lock_acquire (&filesys_lock);
+          f->eax = file_tell (cur->fd_table[fd]);
+          lock_release (&filesys_lock);
+        }
+      else
+        {
+          f->eax = -1;
+        }
+    }
+  else if (syscall_number == SYS_REMOVE)
+    {
+      check_valid_buffer (&args[1], sizeof (int));
+
+      const char *file_name = (const char *) args[1];
+      check_valid_string (file_name);
+
+      lock_acquire (&filesys_lock);
+      f->eax = filesys_remove (file_name);
+      lock_release (&filesys_lock);
+    }
+  else if (syscall_number == SYS_HALT)
+  {
+    shutdown_power_off ();
+  }
+  else if (syscall_number == SYS_EXIT)
+  {
+    check_valid_buffer (&args[1], sizeof (int));
+    sys_exit (args[1]);
+  }
   else 
     {
       sys_exit (-1);
